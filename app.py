@@ -16,9 +16,7 @@ app = Flask(__name__)
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
 GEMINI_MODEL = "gemini-3.7-flash"
 
-DATASET_BASE = "https://raw.githubusercontent.com/harin-git/GlobalMood/main/Data/"
-SONG_METADATA_URL = DATASET_BASE + "songmeta_GlobalMood.csv"
-MOOD_DATA_URL = DATASET_BASE + "chains_GlobalMood.csv"
+DATASET_URL = "https://gist.githubusercontent.com/okerx/613538c03a30dbd89a125c61913fa63b/raw/spotify_tracks.csv"
 
 MAX_INPUT_LENGTH = 500
 DEFAULT_LIMIT = 5
@@ -148,23 +146,22 @@ def load_song_metadata() -> List[Dict[str, str]]:
     if DATA_CACHE["songs"] is not None:
         return DATA_CACHE["songs"]
 
-    content = fetch_text(SONG_METADATA_URL)
+    content = fetch_text(DATASET_URL)
     reader = csv.DictReader(io.StringIO(content))
+
     rows = []
 
     for row in reader:
-        video_id = row.get("videoID", "").strip()
-        song = row.get("song", "").strip()
-        artist = row.get("artist", "").strip()
-        country = row.get("country", "").strip()
+        song = row.get("name", "").strip()
+        artist = row.get("artists", "").strip()
+        mood = row.get("mood", "").strip()
 
-        if song and video_id:
+        if song:
             rows.append(
                 {
-                    "video_id": video_id,
                     "song": song,
                     "artist": artist,
-                    "country": country,
+                    "mood": mood,
                 }
             )
 
@@ -172,81 +169,12 @@ def load_song_metadata() -> List[Dict[str, str]]:
     return rows
 
 
-def load_mood_data() -> List[Dict[str, str]]:
-    if DATA_CACHE["moods"] is not None:
-        return DATA_CACHE["moods"]
 
-    try:
-        content = fetch_text(MOOD_DATA_URL)
-    except Exception:
-        DATA_CACHE["moods"] = []
-        return []
-
-    reader = csv.DictReader(io.StringIO(content))
-
-    if not reader.fieldnames:
-        DATA_CACHE["moods"] = []
-        return []
-
-    fields = list(reader.fieldnames)
-
-    # GlobalMood's chain file can use different names for the
-    # video/song identifier and mood descriptor. Detect them safely.
-    video_column = find_column(
-        fields,
-        [
-            "videoID",
-            "video_id",
-            "videoid",
-            "video",
-            "songID",
-            "song_id",
-            "songid",
-        ],
-    )
-
-    mood_column = find_column(
-        fields,
-        [
-            "tag",
-            "mood",
-            "mood_tag",
-            "moodtag",
-            "descriptor",
-            "mood_descriptor",
-            "mooddescriptor",
-            "word",
-            "response",
-            "chain",
-        ],
-    )
-
-    # If the file doesn't expose a recognizable video ID column,
-    # keep the cache empty rather than inventing a relationship.
-    if not video_column or not mood_column:
-        DATA_CACHE["moods"] = []
-        return []
-
-    rows = []
-
-    for row in reader:
-        video_id = str(row.get(video_column, "")).strip()
-        mood = str(row.get(mood_column, "")).strip()
-
-        if video_id and mood:
-            rows.append(
-                {
-                    "video_id": video_id,
-                    "mood": mood,
-                }
-            )
-
-    DATA_CACHE["moods"] = rows
-    return rows
-
-
-def music_tool(music_request: str, limit: int = DEFAULT_LIMIT) -> List[Dict[str, str]]:
-    """Find real songs by matching the requested mood against the GitHub dataset."""
+def music_tool(
+    music_request: str,
+    limit: int = DEFAULT_LIMIT
+) -> List[Dict[str, str]]:
+    """Find real songs from the GitHub dataset."""
 
     query = normalize(music_request)
 
@@ -256,153 +184,112 @@ def music_tool(music_request: str, limit: int = DEFAULT_LIMIT) -> List[Dict[str,
     limit = safe_int(limit)
 
     songs = load_song_metadata()
-    mood_rows = load_mood_data()
 
-    # Create an index using the real videoID from song metadata.
-    song_index = {}
-
-    for song in songs:
-        video_id = normalize(song.get("video_id", ""))
-
-        if video_id:
-            song_index[video_id] = song
-
-    # Words from the user's request.
-    query_words = [
-        word
-        for word in re.findall(r"[a-zA-ZÀ-ÿ0-9']+", query)
-        if len(word) > 2
-    ]
-
-    # Common request words that should NOT be treated as mood tags.
-    ignored_words = {
-        "give",
-        "some",
-        "song",
-        "songs",
-        "music",
-        "want",
-        "with",
-        "their",
-        "artist",
-        "artists",
-        "recommend",
-        "recommendation",
-        "suggest",
-        "suggestions",
-        "please",
-        "show",
-        "find",
-        "me",
-        "for",
-        "the",
-        "and",
-        "get",
-        "can",
-        "you",
+    # Detect requested moods.
+    mood_keywords = {
+        "sad": ["sad", "melancholic", "melancholy"],
+        "happy": ["happy", "cheerful", "joyful"],
+        "energetic": ["energetic", "energy", "excited"],
+        "relaxing": ["relaxing", "relaxed", "calm"],
+        "soothing": ["soothing", "calm", "relaxed"],
+        "romantic": ["romantic", "love"],
+        "motivational": ["motivational", "motivation"],
+        "angry": ["angry"],
+        "peaceful": ["peaceful", "calm"],
     }
 
-    mood_words = [
-        word for word in query_words
-        if word not in ignored_words
-    ]
+    requested_moods = []
 
-    matching_video_ids = set()
+    for mood, keywords in mood_keywords.items():
+        if any(keyword in query for keyword in keywords):
+            requested_moods.append(mood)
 
-    # Match the requested mood against the actual mood/tag text.
-    for row in mood_rows:
-
-        video_id = normalize(row.get("video_id", ""))
-        mood = normalize(row.get("mood", ""))
-
-        if not video_id or not mood:
-            continue
-
-        # Exact phrase match.
-        if query in mood:
-            matching_video_ids.add(video_id)
-            continue
-
-        # Individual meaningful mood-word match.
-        if any(word in mood for word in mood_words):
-            matching_video_ids.add(video_id)
-
-    # Convert the matching video IDs back into real song metadata.
     results = []
 
-    for video_id in matching_video_ids:
+    for song in songs:
 
-        song = song_index.get(video_id)
+        song_mood = normalize(song.get("mood", ""))
 
-        if not song:
-            continue
+        # Match requested mood against actual dataset mood.
+        if requested_moods:
+            if not any(
+                mood in song_mood
+                for mood in requested_moods
+            ):
+                continue
 
         results.append(
             {
                 "song": song.get("song", ""),
                 "artist": song.get("artist", ""),
-                "country": song.get("country", ""),
+                "mood": song.get("mood", ""),
             }
         )
 
         if len(results) >= limit:
             break
 
-    # Remove duplicate song names.
-    unique = []
-    seen = set()
+    # If the request is a specific song name,
+    # search the real dataset.
+    if not results:
+        for song in songs:
 
-    for result in results:
+            song_name = normalize(song.get("song", ""))
 
-        song_key = normalize(result.get("song", ""))
+            if query in song_name or song_name in query:
+                results.append(
+                    {
+                        "song": song.get("song", ""),
+                        "artist": song.get("artist", ""),
+                        "mood": song.get("mood", ""),
+                    }
+                )
 
-        if not song_key:
-            continue
+            if len(results) >= limit:
+                break
 
-        if song_key in seen:
-            continue
-
-        seen.add(song_key)
-        unique.append(result)
-
-        if len(unique) >= limit:
-            break
-
-    return unique[:limit]
-
+    return results[:limit]
 
 def artist_tool(song_name: str) -> Optional[Dict[str, str]]:
-    """Look up an artist only in the GitHub dataset."""
+    """Find the artist of a real song in the GitHub dataset."""
+
     if not song_name:
         return None
 
     songs = load_song_metadata()
     requested = normalize(song_name)
 
+    # Exact match first.
     for song in songs:
-        if normalize(song["song"]) == requested:
+        if normalize(song.get("song", "")) == requested:
             return {
-                "song": song["song"],
-                "artist": song["artist"],
-                "available": bool(song["artist"].strip()),
+                "song": song.get("song", ""),
+                "artist": song.get("artist", ""),
+                "available": bool(song.get("artist", "").strip()),
             }
 
-    possible_matches = [
-        song for song in songs
-        if requested in normalize(song["song"]) or
-           normalize(song["song"]) in requested
-    ]
+    # Conservative partial match.
+    matches = []
 
-    if len(possible_matches) == 1:
-        song = possible_matches[0]
+    for song in songs:
+        song_name_normalized = normalize(song.get("song", ""))
+
+        if (
+            requested in song_name_normalized
+            or song_name_normalized in requested
+        ):
+            matches.append(song)
+
+    if len(matches) == 1:
+        song = matches[0]
+
         return {
-            "song": song["song"],
-            "artist": song["artist"],
-            "available": bool(song["artist"].strip()),
+            "song": song.get("song", ""),
+            "artist": song.get("artist", ""),
+            "available": bool(song.get("artist", "").strip()),
         }
 
     return None
-
 
 def deterministic_response(tool_results: Any, response_type: str) -> str:
     if response_type == "artist":
